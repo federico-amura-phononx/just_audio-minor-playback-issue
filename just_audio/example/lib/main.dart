@@ -2,6 +2,8 @@
 // More advanced examples demonstrating other features can be found in the same
 // directory as this example in the GitHub repository.
 
+import 'dart:async';
+
 import 'package:audio_session/audio_session.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -19,15 +21,27 @@ class MyApp extends StatefulWidget {
 }
 
 class MyAppState extends State<MyApp> with WidgetsBindingObserver {
-  final _player = AudioPlayer();
+  AudioPlayer? _player;
+
+  Timer? _timer;
+  final Duration _delay = const Duration(seconds: 5);
+  Duration _timerValue = Duration.zero;
+
+  final _list = <String>[
+    "https://download.samplelib.com/mp3/sample-3s.mp3",
+    "https://download.samplelib.com/mp3/sample-6s.mp3",
+    "https://download.samplelib.com/mp3/sample-9s.mp3",
+  ];
+  int _currentIndex = -1;
+  bool _waiting = false;
+
+  final _streamSubcriptions = <StreamSubscription>[];
 
   @override
   void initState() {
     super.initState();
     ambiguate(WidgetsBinding.instance)!.addObserver(this);
-    SystemChrome.setSystemUIOverlayStyle(const SystemUiOverlayStyle(
-      statusBarColor: Colors.black,
-    ));
+    SystemChrome.setSystemUIOverlayStyle(const SystemUiOverlayStyle(statusBarColor: Colors.black));
     _init();
   }
 
@@ -36,16 +50,66 @@ class MyAppState extends State<MyApp> with WidgetsBindingObserver {
     // We pick a reasonable default for an app that plays speech.
     final session = await AudioSession.instance;
     await session.configure(const AudioSessionConfiguration.speech());
-    // Listen to errors during playback.
-    _player.playbackEventStream.listen((event) {},
-        onError: (Object e, StackTrace stackTrace) {
-      print('A stream error occurred: $e');
+  }
+
+  _startTimer() {
+    setState(() {
+      _timerValue = Duration.zero;
+      _waiting = true;
     });
-    // Try to load audio from a source and catch any errors.
+
+    const t = Duration(milliseconds: 100);
+    _timer?.cancel();
+    Duration elapsed = Duration.zero;
+    _timer = Timer.periodic(t, (timer) {
+      elapsed += t;
+      setState(() {
+        _timerValue = elapsed;
+      });
+
+      if (elapsed >= _delay) {
+        setState(() {
+          _waiting = false;
+        });
+
+        _timer?.cancel();
+        _playNext();
+      }
+    });
+  }
+
+  _playNext() async {
+    int index = _currentIndex + 1;
+    if (index >= _list.length) {
+      index = 0;
+    }
+
+    setState(() {
+      _currentIndex = index;
+    });
+
+    for (var element in _streamSubcriptions) {
+      element.cancel();
+    }
+    _streamSubcriptions.clear();
+
+    await _player?.dispose();
+    final player = AudioPlayer();
+    setState(() {
+      _player = player;
+    });
+
+    final subscription = player.playerStateStream.listen((event) {
+      if (event.processingState == ProcessingState.completed && event.playing) {
+        _startTimer();
+      }
+    });
+    _streamSubcriptions.add(subscription);
+
+    final current = _list[_currentIndex];
     try {
-      // AAC example: https://dl.espressif.com/dl/audio/ff-16b-2c-44100hz.aac
-      await _player.setAudioSource(AudioSource.uri(Uri.parse(
-          "https://s3.amazonaws.com/scifri-episodes/scifri20181123-episode.mp3")));
+      await player.setAudioSource(AudioSource.uri(Uri.parse(current)));
+      await player.play();
     } catch (e) {
       print("Error loading audio source: $e");
     }
@@ -56,7 +120,10 @@ class MyAppState extends State<MyApp> with WidgetsBindingObserver {
     ambiguate(WidgetsBinding.instance)!.removeObserver(this);
     // Release decoders and buffers back to the operating system making them
     // available for other apps to use.
-    _player.dispose();
+    for (var element in _streamSubcriptions) {
+      element.cancel();
+    }
+    _player?.dispose();
     super.dispose();
   }
 
@@ -66,22 +133,22 @@ class MyAppState extends State<MyApp> with WidgetsBindingObserver {
       // Release the player's resources when not in use. We use "stop" so that
       // if the app resumes later, it will still remember what position to
       // resume from.
-      _player.stop();
+      _player?.stop();
     }
   }
 
   /// Collects the data useful for displaying in a seek bar, using a handy
   /// feature of rx_dart to combine the 3 streams of interest into one.
-  Stream<PositionData> get _positionDataStream =>
-      Rx.combineLatest3<Duration, Duration, Duration?, PositionData>(
-          _player.positionStream,
-          _player.bufferedPositionStream,
-          _player.durationStream,
-          (position, bufferedPosition, duration) => PositionData(
-              position, bufferedPosition, duration ?? Duration.zero));
+  Stream<PositionData> _positionDataStream(AudioPlayer player) => Rx.combineLatest3<Duration, Duration, Duration?, PositionData>(
+      player.positionStream,
+      player.bufferedPositionStream,
+      player.durationStream,
+      (position, bufferedPosition, duration) => PositionData(position, bufferedPosition, duration ?? Duration.zero));
 
   @override
   Widget build(BuildContext context) {
+    final player = _player;
+
     return MaterialApp(
       debugShowCheckedModeBanner: false,
       home: Scaffold(
@@ -90,23 +157,32 @@ class MyAppState extends State<MyApp> with WidgetsBindingObserver {
             crossAxisAlignment: CrossAxisAlignment.center,
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
-              // Display play/pause button and volume/speed sliders.
-              ControlButtons(_player),
-              // Display seek bar. Using StreamBuilder, this widget rebuilds
-              // each time the position, buffered position or duration changes.
-              StreamBuilder<PositionData>(
-                stream: _positionDataStream,
-                builder: (context, snapshot) {
-                  final positionData = snapshot.data;
-                  return SeekBar(
-                    duration: positionData?.duration ?? Duration.zero,
-                    position: positionData?.position ?? Duration.zero,
-                    bufferedPosition:
-                        positionData?.bufferedPosition ?? Duration.zero,
-                    onChangeEnd: _player.seek,
-                  );
-                },
-              ),
+              if (player == null) ...[
+                Center(
+                  child: ElevatedButton(
+                    onPressed: _playNext,
+                    child: const Text("Start"),
+                  ),
+                ),
+              ],
+              if (player != null) ...[
+                // Display play/pause button and volume/speed sliders.
+                Text("Current index: $_currentIndex"),
+                if (_waiting) Text("The next audio will play in: ${(_delay - _timerValue).toString()}"),
+                ControlButtons(player),
+                StreamBuilder<PositionData>(
+                  stream: _positionDataStream(player),
+                  builder: (context, snapshot) {
+                    final positionData = snapshot.data;
+                    return SeekBar(
+                      duration: positionData?.duration ?? Duration.zero,
+                      position: positionData?.position ?? Duration.zero,
+                      bufferedPosition: positionData?.bufferedPosition ?? Duration.zero,
+                      onChangeEnd: player.seek,
+                    );
+                  },
+                ),
+              ]
             ],
           ),
         ),
@@ -153,8 +229,7 @@ class ControlButtons extends StatelessWidget {
             final playerState = snapshot.data;
             final processingState = playerState?.processingState;
             final playing = playerState?.playing;
-            if (processingState == ProcessingState.loading ||
-                processingState == ProcessingState.buffering) {
+            if (processingState == ProcessingState.loading || processingState == ProcessingState.buffering) {
               return Container(
                 margin: const EdgeInsets.all(8.0),
                 width: 64.0,
@@ -186,8 +261,7 @@ class ControlButtons extends StatelessWidget {
         StreamBuilder<double>(
           stream: player.speedStream,
           builder: (context, snapshot) => IconButton(
-            icon: Text("${snapshot.data?.toStringAsFixed(1)}x",
-                style: const TextStyle(fontWeight: FontWeight.bold)),
+            icon: Text("${snapshot.data?.toStringAsFixed(1)}x", style: const TextStyle(fontWeight: FontWeight.bold)),
             onPressed: () {
               showSliderDialog(
                 context: context,
